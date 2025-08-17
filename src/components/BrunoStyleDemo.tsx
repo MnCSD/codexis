@@ -2,10 +2,12 @@
 
 import React, { useRef, useEffect, useState } from 'react';
 import * as THREE from 'three';
+import * as CANNON from 'cannon-es';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 interface CodeBlock {
   mesh: THREE.Group;
+  body?: CANNON.Body;
   type: 'function' | 'class' | 'module';
   name: string;
 }
@@ -20,32 +22,54 @@ interface BuildingData {
   dependencies: string[];
 }
 
+interface Vehicle {
+  mesh: THREE.Group;
+  body: CANNON.Body;
+  wheels: { mesh: THREE.Mesh; body: CANNON.Body }[];
+}
+
 const BrunoStyleDemo: React.FC = () => {
   const mountRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const worldRef = useRef<CANNON.World | null>(null);
+  const vehicleRef = useRef<Vehicle | null>(null);
   const codeBlocksRef = useRef<CodeBlock[]>([]);
+  const clockRef = useRef<THREE.Clock>(new THREE.Clock());
+  const keysRef = useRef<{ [key: string]: boolean }>({});
+  
   const [isLoaded, setIsLoaded] = useState(false);
-  const [loadingProgress, setLoadingProgress] = useState('Initializing...');
+  const [loadingProgress, setLoadingProgress] = useState('Initializing physics world...');
   const [hoveredBlock, setHoveredBlock] = useState<string | null>(null);
+  const [cameraMode, setCameraMode] = useState<'follow' | 'free' | 'overview'>('follow');
+  const [showInstructions, setShowInstructions] = useState(true);
 
   useEffect(() => {
     if (!mountRef.current) return;
 
-    // Define district layout FIRST (grid-based, deterministic)
+    // Physics World Setup
+    const world = new CANNON.World({
+      gravity: new CANNON.Vec3(0, -9.82, 0),
+    });
+    world.broadphase = new CANNON.NaiveBroadphase();
+    world.solver.iterations = 10;
+    worldRef.current = world;
+
+    // Define district layout
     const districts = {
-      'core': { center: { x: 0, z: 0 }, color: 0x8b5cf6 }, // Purple - Core system
-      'auth': { center: { x: -40, z: 0 }, color: 0xef4444 }, // Red - Authentication
-      'api': { center: { x: 40, z: 0 }, color: 0x06b6d4 }, // Cyan - API layer
-      'database': { center: { x: 0, z: -40 }, color: 0x10b981 }, // Green - Data layer
-      'ui': { center: { x: 0, z: 40 }, color: 0xf59e0b }, // Orange - UI components
-      'utils': { center: { x: -40, z: -40 }, color: 0x6b7280 }, // Gray - Utilities
+      'core': { center: { x: 0, z: 0 }, color: 0x8b5cf6 },
+      'auth': { center: { x: -40, z: 0 }, color: 0xef4444 },
+      'api': { center: { x: 40, z: 0 }, color: 0x06b6d4 },
+      'database': { center: { x: 0, z: -40 }, color: 0x10b981 },
+      'ui': { center: { x: 0, z: 40 }, color: 0xf59e0b },
+      'utils': { center: { x: -40, z: -40 }, color: 0x6b7280 },
     };
 
     // Scene setup
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x1a1a2e);
+    scene.background = new THREE.Color(0x87CEEB); // Sky blue
+    scene.fog = new THREE.Fog(0x87CEEB, 100, 300);
     sceneRef.current = scene;
 
     // Camera setup
@@ -55,772 +79,444 @@ const BrunoStyleDemo: React.FC = () => {
       0.1,
       1000
     );
-    camera.position.set(30, 20, 30);
-    camera.lookAt(0, 0, 0);
+    camera.position.set(0, 15, 30);
     cameraRef.current = camera;
 
     // Renderer setup
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(mountRef.current.clientWidth, mountRef.current.clientHeight);
-    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.2;
     rendererRef.current = renderer;
     mountRef.current.appendChild(renderer.domElement);
 
-    // Beautiful grass terrain with texture
-    const createGrassTexture = () => {
-      const canvas = document.createElement('canvas');
-      canvas.width = 512;
-      canvas.height = 512;
-      const ctx = canvas.getContext('2d')!;
-      
-      // Base grass color
-      ctx.fillStyle = '#2d5016';
-      ctx.fillRect(0, 0, 512, 512);
-      
-      // Add grass blade texture
-      for (let i = 0; i < 3000; i++) {
-        const x = Math.random() * 512;
-        const y = Math.random() * 512;
-        const shade = Math.random() * 0.3 + 0.7;
-        ctx.fillStyle = `hsl(${80 + Math.random() * 40}, ${60 + Math.random() * 20}%, ${20 + Math.random() * 15}%)`;
-        ctx.fillRect(x, y, 1 + Math.random(), 1 + Math.random());
-      }
-      
-      // Add some dirt patches
-      for (let i = 0; i < 50; i++) {
-        const x = Math.random() * 512;
-        const y = Math.random() * 512;
-        const size = Math.random() * 20 + 5;
-        ctx.fillStyle = `hsl(30, ${30 + Math.random() * 20}%, ${25 + Math.random() * 10}%)`;
-        ctx.beginPath();
-        ctx.arc(x, y, size, 0, Math.PI * 2);
-        ctx.fill();
-      }
-      
-      const texture = new THREE.CanvasTexture(canvas);
-      texture.wrapS = THREE.RepeatWrapping;
-      texture.wrapT = THREE.RepeatWrapping;
-      texture.repeat.set(12, 12);
-      return texture;
+    // Enhanced lighting system
+    const setupLighting = () => {
+      // Ambient light
+      const ambientLight = new THREE.AmbientLight(0x404040, 0.4);
+      scene.add(ambientLight);
+
+      // Main directional light (sun)
+      const directionalLight = new THREE.DirectionalLight(0xffffff, 1.2);
+      directionalLight.position.set(100, 100, 50);
+      directionalLight.castShadow = true;
+      directionalLight.shadow.mapSize.width = 2048;
+      directionalLight.shadow.mapSize.height = 2048;
+      directionalLight.shadow.camera.near = 0.5;
+      directionalLight.shadow.camera.far = 500;
+      directionalLight.shadow.camera.left = -100;
+      directionalLight.shadow.camera.right = 100;
+      directionalLight.shadow.camera.top = 100;
+      directionalLight.shadow.camera.bottom = -100;
+      scene.add(directionalLight);
+
+      // Hemisphere light for natural sky lighting
+      const hemisphereLight = new THREE.HemisphereLight(0x87CEEB, 0x8B7355, 0.6);
+      scene.add(hemisphereLight);
+
+      // Rim lighting
+      const rimLight = new THREE.DirectionalLight(0xffffff, 0.3);
+      rimLight.position.set(-50, 20, -50);
+      scene.add(rimLight);
     };
 
-    const grassTexture = createGrassTexture();
-    const terrainGeometry = new THREE.PlaneGeometry(200, 200, 40, 40);
-    const terrainMaterial = new THREE.MeshLambertMaterial({ 
-      map: grassTexture,
-      color: 0x4a7c59,
-    });
-    const terrain = new THREE.Mesh(terrainGeometry, terrainMaterial);
-    terrain.rotation.x = -Math.PI / 2;
-    terrain.receiveShadow = true;
-    terrain.position.y = -0.1;
-    scene.add(terrain);
+    setupLighting();
 
-    // Create district foundations with better integration
-    const createDistrict = (name: string, center: { x: number; z: number }, color: number) => {
-      // District park/plaza area
-      const districtGeometry = new THREE.PlaneGeometry(16, 16);
-      const districtMaterial = new THREE.MeshLambertMaterial({ 
-        color: new THREE.Color(color).lerp(new THREE.Color(0x4a7c59), 0.7),
-        transparent: true,
-        opacity: 0.8
-      });
-      const district = new THREE.Mesh(districtGeometry, districtMaterial);
-      district.rotation.x = -Math.PI / 2;
-      district.position.set(center.x, 0.005, center.z);
-      scene.add(district);
+    // Enhanced terrain with physics
+    const createTerrain = () => {
+      setLoadingProgress('Creating beautiful terrain...');
       
-      // District boundary paths
-      const pathGeometry = new THREE.RingGeometry(7.8, 8.2);
-      const pathMaterial = new THREE.MeshLambertMaterial({ 
-        color: 0x8B7355, // Brown path color
-        transparent: true,
-        opacity: 0.6
-      });
-      const path = new THREE.Mesh(pathGeometry, pathMaterial);
-      path.rotation.x = -Math.PI / 2;
-      path.position.set(center.x, 0.01, center.z);
-      scene.add(path);
-    };
-
-    // Create districts
-    Object.entries(districts).forEach(([name, district]) => {
-      createDistrict(name, district.center, district.color);
-    });
-
-    // Beautiful road system using Kenney.nl assets
-    const roadAssets = {
-      straight: '/roads/GLB%20format/road-straight.glb',
-      intersection: '/roads/GLB%20format/road-intersection.glb',
-      crossroad: '/roads/GLB%20format/road-crossroad.glb',
-      curve: '/roads/GLB%20format/road-curve.glb',
-      bend: '/roads/GLB%20format/road-bend.glb',
-      sidewalk: '/roads/GLB%20format/road-bend-sidewalk.glb',
-      lightSquare: '/roads/GLB%20format/light-square.glb',
-      sign: '/roads/GLB%20format/sign-highway.glb',
-      barrier: '/roads/GLB%20format/construction-barrier.glb'
-    };
-
-    // Load road model function
-    const loadRoadModel = (path: string): Promise<THREE.Group> => {
-      return new Promise((resolve, reject) => {
-        gltfLoader.load(
-          path,
-          (gltf: any) => {
-            const model = gltf.scene.clone();
-            model.traverse((child: THREE.Object3D) => {
-              if (child instanceof THREE.Mesh) {
-                child.castShadow = true;
-                child.receiveShadow = true;
-              }
-            });
-            resolve(model);
-          },
-          undefined,
-          (error: any) => {
-            console.error(`Failed to load road model: ${path}`, error);
-            reject(error);
-          }
-        );
-      });
-    };
-
-    // Create beautiful road network
-    const createRoadNetwork = async () => {
-      setLoadingProgress('Building road network...');
+      // Create heightmap for varied terrain
+      const terrainSize = 200;
+      const terrainSegments = 50;
+      const terrainGeometry = new THREE.PlaneGeometry(terrainSize, terrainSize, terrainSegments, terrainSegments);
       
-      try {
-        // Load essential road models
-        const [straightRoad, intersection, crossroad, streetLight] = await Promise.all([
-          loadRoadModel(roadAssets.straight),
-          loadRoadModel(roadAssets.intersection),
-          loadRoadModel(roadAssets.crossroad),
-          loadRoadModel(roadAssets.lightSquare)
-        ]);
-
-        // Define road grid positions
-        const roadPieces = [
-          // Central crossroad
-          { model: crossroad, pos: [0, 0, 0], rotation: 0 },
-          
-          // Main horizontal roads
-          { model: straightRoad, pos: [-20, 0, 0], rotation: Math.PI / 2 },
-          { model: straightRoad, pos: [20, 0, 0], rotation: Math.PI / 2 },
-          { model: intersection, pos: [-40, 0, 0], rotation: 0 },
-          { model: intersection, pos: [40, 0, 0], rotation: 0 },
-          
-          // Main vertical roads
-          { model: straightRoad, pos: [0, 0, -20], rotation: 0 },
-          { model: straightRoad, pos: [0, 0, 20], rotation: 0 },
-          { model: intersection, pos: [0, 0, -40], rotation: Math.PI / 2 },
-          { model: intersection, pos: [0, 0, 40], rotation: Math.PI / 2 },
-          
-          // District connector roads
-          { model: straightRoad, pos: [-40, 0, -20], rotation: Math.PI / 2 },
-          { model: intersection, pos: [-40, 0, -40], rotation: 0 },
-          { model: straightRoad, pos: [-20, 0, -40], rotation: 0 },
-          
-          // Extended grid for realistic city feel
-          { model: straightRoad, pos: [-60, 0, 0], rotation: Math.PI / 2 },
-          { model: straightRoad, pos: [60, 0, 0], rotation: Math.PI / 2 },
-          { model: straightRoad, pos: [0, 0, -60], rotation: 0 },
-          { model: straightRoad, pos: [0, 0, 60], rotation: 0 },
-          
-          // Additional intersections for connectivity
-          { model: intersection, pos: [-20, 0, -20], rotation: 0 },
-          { model: intersection, pos: [20, 0, 20], rotation: 0 },
-          { model: intersection, pos: [-20, 0, 20], rotation: 0 },
-          { model: intersection, pos: [20, 0, -20], rotation: 0 },
-        ];
-
-        // Place all road pieces
-        roadPieces.forEach(({ model, pos, rotation }) => {
-          const roadInstance = model.clone();
-          roadInstance.position.set(pos[0], pos[1], pos[2]);
-          roadInstance.rotation.y = rotation;
-          roadInstance.scale.setScalar(1.1); // Slightly larger for better coverage
-          scene.add(roadInstance);
-        });
-
-        // Add street lighting along main roads
-        const lightPositions = [
-          // Along main horizontal roads
-          { x: -30, z: 5 }, { x: -10, z: 5 }, { x: 10, z: 5 }, { x: 30, z: 5 },
-          { x: -30, z: -5 }, { x: -10, z: -5 }, { x: 10, z: -5 }, { x: 30, z: -5 },
-          
-          // Along main vertical roads
-          { x: 5, z: -30 }, { x: 5, z: -10 }, { x: 5, z: 10 }, { x: 5, z: 30 },
-          { x: -5, z: -30 }, { x: -5, z: -10 }, { x: -5, z: 10 }, { x: -5, z: 30 },
-          
-          // Around districts for ambient lighting
-          { x: -50, z: 10 }, { x: -50, z: -10 }, { x: 50, z: 10 }, { x: 50, z: -10 },
-          { x: 10, z: -50 }, { x: -10, z: -50 }, { x: 10, z: 50 }, { x: -10, z: 50 },
-        ];
-
-        // Place street lights with actual light sources
-        lightPositions.forEach(({ x, z }) => {
-          const light = streetLight.clone();
-          light.position.set(x, 0, z);
-          light.scale.setScalar(0.8);
-          scene.add(light);
-          
-          // Add actual point light for illumination
-          const pointLight = new THREE.PointLight(0xffa500, 0.4, 20);
-          pointLight.position.set(x, 5, z);
-          pointLight.castShadow = true;
-          pointLight.shadow.mapSize.width = 1024;
-          pointLight.shadow.mapSize.height = 1024;
-          scene.add(pointLight);
-        });
-
-        console.log('✅ Beautiful road network created with Kenney.nl models!');
-      } catch (error) {
-        console.error('❌ Failed to load road models, using fallback:', error);
-        // Fallback to simple roads if models fail to load
-        createSimpleRoadFallback();
-      }
-    };
-
-    // Fallback simple road system
-    const createSimpleRoadFallback = () => {
-      const createRoad = (from: { x: number; z: number }, to: { x: number; z: number }) => {
-        const dx = to.x - from.x;
-        const dz = to.z - from.z;
-        const length = Math.sqrt(dx * dx + dz * dz);
-        const angle = Math.atan2(dz, dx);
+      // Add height variation
+      const vertices = terrainGeometry.attributes.position.array;
+      for (let i = 0; i < vertices.length; i += 3) {
+        const x = vertices[i];
+        const z = vertices[i + 2];
+        const distance = Math.sqrt(x * x + z * z);
         
-        const roadGeometry = new THREE.PlaneGeometry(length - 20, 4);
-        const roadMaterial = new THREE.MeshLambertMaterial({ 
-          color: 0x444444,
-          transparent: true,
-          opacity: 0.8
-        });
-        const road = new THREE.Mesh(roadGeometry, roadMaterial);
-        road.rotation.x = -Math.PI / 2;
-        road.rotation.z = angle;
-        road.position.set((from.x + to.x) / 2, 0.01, (from.z + to.z) / 2);
-        scene.add(road);
+        // Create gentle hills and valleys
+        vertices[i + 1] = Math.sin(x * 0.02) * Math.cos(z * 0.02) * 3 + 
+                          Math.sin(distance * 0.01) * 2;
+      }
+      terrainGeometry.attributes.position.needsUpdate = true;
+      terrainGeometry.computeVertexNormals();
+
+      // Enhanced grass texture
+      const createGrassTexture = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = 512;
+        canvas.height = 512;
+        const ctx = canvas.getContext('2d')!;
+        
+        // Base grass color with gradient
+        const gradient = ctx.createLinearGradient(0, 0, 0, 512);
+        gradient.addColorStop(0, '#4a7c59');
+        gradient.addColorStop(1, '#2d5016');
+        ctx.fillStyle = gradient;
+        ctx.fillRect(0, 0, 512, 512);
+        
+        // Add detailed grass texture
+        for (let i = 0; i < 5000; i++) {
+          const x = Math.random() * 512;
+          const y = Math.random() * 512;
+          const hue = 80 + Math.random() * 40;
+          const sat = 60 + Math.random() * 20;
+          const light = 20 + Math.random() * 25;
+          ctx.fillStyle = `hsl(${hue}, ${sat}%, ${light}%)`;
+          ctx.fillRect(x, y, 1 + Math.random(), 2 + Math.random() * 2);
+        }
+        
+        const texture = new THREE.CanvasTexture(canvas);
+        texture.wrapS = THREE.RepeatWrapping;
+        texture.wrapT = THREE.RepeatWrapping;
+        texture.repeat.set(20, 20);
+        return texture;
       };
 
-      // Create basic connectivity
-      createRoad(districts.core.center, districts.auth.center);
-      createRoad(districts.core.center, districts.api.center);
-      createRoad(districts.core.center, districts.database.center);
-      createRoad(districts.api.center, districts.auth.center);
-      createRoad(districts.api.center, districts.database.center);
-      createRoad(districts.auth.center, districts.utils.center);
+      const grassTexture = createGrassTexture();
+      const terrainMaterial = new THREE.MeshLambertMaterial({ 
+        map: grassTexture,
+        color: 0x4a7c59,
+      });
+      
+      const terrain = new THREE.Mesh(terrainGeometry, terrainMaterial);
+      terrain.rotation.x = -Math.PI / 2;
+      terrain.receiveShadow = true;
+      scene.add(terrain);
+
+      // Physics ground
+      const groundShape = new CANNON.Plane();
+      const groundBody = new CANNON.Body({ mass: 0 });
+      groundBody.addShape(groundShape);
+      groundBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2);
+      world.addBody(groundBody);
     };
 
-    // Initialize road network
-    createRoadNetwork();
+    createTerrain();
 
-    // Add beautiful trees and natural elements
-    const createTrees = () => {
-      setLoadingProgress('Planting trees and greenery...');
+    // Enhanced road system with physics
+    const createRoadSystem = () => {
+      setLoadingProgress('Building road network...');
       
-      const treePositions = [
-        // Around districts (parks and green spaces)
-        { x: -15, z: 15, type: 'oak' }, { x: 15, z: 15, type: 'pine' }, 
-        { x: -15, z: -15, type: 'birch' }, { x: 15, z: -15, type: 'oak' },
-        
-        // Auth district landscaping
-        { x: -55, z: 10, type: 'pine' }, { x: -55, z: -10, type: 'oak' },
-        { x: -25, z: 10, type: 'birch' }, { x: -25, z: -10, type: 'pine' },
-        
-        // API district landscaping
-        { x: 55, z: 10, type: 'oak' }, { x: 55, z: -10, type: 'birch' },
-        { x: 25, z: 10, type: 'pine' }, { x: 25, z: -10, type: 'oak' },
-        
-        // Database district landscaping
-        { x: -15, z: -55, type: 'birch' }, { x: 15, z: -55, type: 'pine' },
-        { x: -15, z: -25, type: 'oak' }, { x: 15, z: -25, type: 'birch' },
-        
-        // UI district landscaping
-        { x: -15, z: 55, type: 'pine' }, { x: 15, z: 55, type: 'oak' },
-        { x: -15, z: 25, type: 'birch' }, { x: 15, z: 25, type: 'pine' },
-        
-        // Utils district landscaping
-        { x: -55, z: -55, type: 'oak' }, { x: -55, z: -25, type: 'pine' },
-        { x: -25, z: -55, type: 'birch' }, { x: -25, z: -25, type: 'oak' },
-        
-        // Perimeter trees for natural boundaries
-        { x: -70, z: 0, type: 'pine' }, { x: 70, z: 0, type: 'oak' },
-        { x: 0, z: -70, type: 'birch' }, { x: 0, z: 70, type: 'pine' },
-        { x: -70, z: -35, type: 'oak' }, { x: 70, z: 35, type: 'birch' },
-        { x: -35, z: 70, type: 'pine' }, { x: 35, z: -70, type: 'oak' },
-        
-        // Random scattered trees for natural feel
-        { x: -80, z: 20, type: 'birch' }, { x: 80, z: -20, type: 'pine' },
-        { x: 20, z: 80, type: 'oak' }, { x: -20, z: -80, type: 'birch' },
-        { x: -65, z: 45, type: 'pine' }, { x: 65, z: -45, type: 'oak' },
-        { x: 45, z: 65, type: 'birch' }, { x: -45, z: -65, type: 'pine' },
+      // Create main road loop
+      const roadWidth = 8;
+      const roadPoints = [
+        new THREE.Vector3(-60, 0.1, 0),
+        new THREE.Vector3(-30, 0.1, -30),
+        new THREE.Vector3(0, 0.1, -60),
+        new THREE.Vector3(30, 0.1, -30),
+        new THREE.Vector3(60, 0.1, 0),
+        new THREE.Vector3(30, 0.1, 30),
+        new THREE.Vector3(0, 0.1, 60),
+        new THREE.Vector3(-30, 0.1, 30),
+        new THREE.Vector3(-60, 0.1, 0),
       ];
 
-      treePositions.forEach(({ x, z, type }) => {
-        // Create varied tree trunk
-        const trunkHeight = 1.5 + Math.random() * 1;
-        const trunkRadius = 0.15 + Math.random() * 0.1;
-        const trunkGeometry = new THREE.CylinderGeometry(trunkRadius, trunkRadius + 0.05, trunkHeight, 8);
-        const trunkMaterial = new THREE.MeshLambertMaterial({ 
-          color: new THREE.Color().setHSL(0.08, 0.6, 0.15 + Math.random() * 0.1)
-        });
-        const trunk = new THREE.Mesh(trunkGeometry, trunkMaterial);
-        trunk.position.set(x, trunkHeight / 2, z);
-        trunk.castShadow = true;
-        scene.add(trunk);
+      const roadCurve = new THREE.CatmullRomCurve3(roadPoints, true);
+      const roadGeometry = new THREE.TubeGeometry(roadCurve, 200, roadWidth / 2, 8, false);
+      const roadMaterial = new THREE.MeshLambertMaterial({ 
+        color: 0x444444,
+        transparent: true,
+        opacity: 0.9
+      });
+      const road = new THREE.Mesh(roadGeometry, roadMaterial);
+      road.receiveShadow = true;
+      scene.add(road);
+
+      // Add road markings
+      const markingGeometry = new THREE.TubeGeometry(roadCurve, 200, 0.1, 4, false);
+      const markingMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff });
+      const roadMarkings = new THREE.Mesh(markingGeometry, markingMaterial);
+      roadMarkings.position.y = 0.01;
+      scene.add(roadMarkings);
+
+      // Store road curve for vehicle path
+      (window as any).roadCurve = roadCurve;
+    };
+
+    createRoadSystem();
+
+    // Create interactive vehicle
+    const createVehicle = () => {
+      setLoadingProgress('Creating your vehicle...');
+      
+      // Vehicle body
+      const vehicleGeometry = new THREE.BoxGeometry(4, 1.5, 2);
+      const vehicleMaterial = new THREE.MeshLambertMaterial({ color: 0xff6b6b });
+      const vehicleMesh = new THREE.Mesh(vehicleGeometry, vehicleMaterial);
+      vehicleMesh.castShadow = true;
+      vehicleMesh.receiveShadow = true;
+      
+      // Vehicle details
+      const detailsGroup = new THREE.Group();
+      
+      // Windshield
+      const windshieldGeometry = new THREE.PlaneGeometry(3, 1);
+      const windshieldMaterial = new THREE.MeshLambertMaterial({ 
+        color: 0x87CEEB, 
+        transparent: true, 
+        opacity: 0.3 
+      });
+      const windshield = new THREE.Mesh(windshieldGeometry, windshieldMaterial);
+      windshield.position.set(0, 0.5, 0.8);
+      windshield.rotation.x = -0.2;
+      detailsGroup.add(windshield);
+      
+      // Headlights
+      const headlightGeometry = new THREE.SphereGeometry(0.2, 8, 8);
+      const headlightMaterial = new THREE.MeshBasicMaterial({ color: 0xffffaa });
+      const leftHeadlight = new THREE.Mesh(headlightGeometry, headlightMaterial);
+      leftHeadlight.position.set(-1.2, 0, 1.1);
+      const rightHeadlight = new THREE.Mesh(headlightGeometry, headlightMaterial);
+      rightHeadlight.position.set(1.2, 0, 1.1);
+      detailsGroup.add(leftHeadlight, rightHeadlight);
+
+      const vehicleGroup = new THREE.Group();
+      vehicleGroup.add(vehicleMesh, detailsGroup);
+      vehicleGroup.position.set(0, 2, 0);
+      scene.add(vehicleGroup);
+
+      // Physics body for vehicle
+      const vehicleShape = new CANNON.Box(new CANNON.Vec3(2, 0.75, 1));
+      const vehicleBody = new CANNON.Body({ mass: 150 });
+      vehicleBody.addShape(vehicleShape);
+      vehicleBody.position.set(0, 2, 0);
+      vehicleBody.material = new CANNON.Material({ friction: 0.3, restitution: 0.3 });
+      world.addBody(vehicleBody);
+
+      // Create wheels
+      const wheels: { mesh: THREE.Mesh; body: CANNON.Body }[] = [];
+      const wheelPositions = [
+        [-1.5, -0.5, 1.2],
+        [1.5, -0.5, 1.2],
+        [-1.5, -0.5, -1.2],
+        [1.5, -0.5, -1.2]
+      ];
+
+      wheelPositions.forEach((pos, index) => {
+        // Wheel mesh
+        const wheelGeometry = new THREE.CylinderGeometry(0.4, 0.4, 0.3, 12);
+        const wheelMaterial = new THREE.MeshLambertMaterial({ color: 0x333333 });
+        const wheelMesh = new THREE.Mesh(wheelGeometry, wheelMaterial);
+        wheelMesh.rotation.z = Math.PI / 2;
+        wheelMesh.castShadow = true;
+        vehicleGroup.add(wheelMesh);
+
+        // Wheel physics
+        const wheelShape = new CANNON.Cylinder(0.4, 0.4, 0.3, 8);
+        const wheelBody = new CANNON.Body({ mass: 10 });
+        wheelBody.addShape(wheelShape);
+        wheelBody.position.set(pos[0], pos[1], pos[2]);
+        wheelBody.material = new CANNON.Material({ friction: 1.5, restitution: 0.1 });
+        world.addBody(wheelBody);
+
+        wheels.push({ mesh: wheelMesh, body: wheelBody });
+      });
+
+      vehicleRef.current = { mesh: vehicleGroup, body: vehicleBody, wheels };
+    };
+
+    createVehicle();
+
+    // Enhanced environment with animated elements
+    const createEnvironment = () => {
+      setLoadingProgress('Planting magical forest...');
+      
+      // Animated trees
+      const treePositions = [
+        { x: -25, z: 25, type: 'oak', scale: 1.2 },
+        { x: 25, z: 25, type: 'pine', scale: 1.0 },
+        { x: -25, z: -25, type: 'birch', scale: 0.8 },
+        { x: 25, z: -25, type: 'oak', scale: 1.1 },
+        { x: -70, z: 20, type: 'pine', scale: 1.3 },
+        { x: 70, z: -20, type: 'birch', scale: 0.9 },
+        { x: 20, z: 70, type: 'oak', scale: 1.0 },
+        { x: -20, z: -70, type: 'pine', scale: 1.2 },
+      ];
+
+      treePositions.forEach(({ x, z, type, scale }) => {
+        const treeGroup = new THREE.Group();
         
-        // Create tree foliage based on type
+        // Trunk
+        const trunkHeight = (1.5 + Math.random() * 1) * scale;
+        const trunkGeometry = new THREE.CylinderGeometry(0.15 * scale, 0.2 * scale, trunkHeight, 8);
+        const trunkMaterial = new THREE.MeshLambertMaterial({ color: 0x8B4513 });
+        const trunk = new THREE.Mesh(trunkGeometry, trunkMaterial);
+        trunk.position.y = trunkHeight / 2;
+        trunk.castShadow = true;
+        treeGroup.add(trunk);
+        
+        // Foliage with animation
         let foliageGeometry: THREE.BufferGeometry;
-        let foliageColor: THREE.Color;
+        let foliageColor: number;
         
         switch (type) {
           case 'oak':
-            foliageGeometry = new THREE.SphereGeometry(1.8 + Math.random() * 0.8, 8, 6);
-            foliageColor = new THREE.Color().setHSL(0.25, 0.7, 0.25 + Math.random() * 0.15);
+            foliageGeometry = new THREE.SphereGeometry(1.8 * scale, 8, 6);
+            foliageColor = 0x228B22;
             break;
           case 'pine':
-            foliageGeometry = new THREE.ConeGeometry(1.2 + Math.random() * 0.5, 2.5 + Math.random() * 1, 6);
-            foliageColor = new THREE.Color().setHSL(0.35, 0.8, 0.2 + Math.random() * 0.1);
+            foliageGeometry = new THREE.ConeGeometry(1.2 * scale, 2.5 * scale, 6);
+            foliageColor = 0x006400;
             break;
           case 'birch':
-            foliageGeometry = new THREE.SphereGeometry(1.3 + Math.random() * 0.6, 8, 6);
-            foliageColor = new THREE.Color().setHSL(0.22, 0.6, 0.3 + Math.random() * 0.15);
+            foliageGeometry = new THREE.SphereGeometry(1.3 * scale, 8, 6);
+            foliageColor = 0x32CD32;
             break;
           default:
-            foliageGeometry = new THREE.SphereGeometry(1.5, 8, 6);
-            foliageColor = new THREE.Color(0x2d5016);
+            foliageGeometry = new THREE.SphereGeometry(1.5 * scale, 8, 6);
+            foliageColor = 0x228B22;
         }
         
         const foliageMaterial = new THREE.MeshLambertMaterial({ color: foliageColor });
         const foliage = new THREE.Mesh(foliageGeometry, foliageMaterial);
-        foliage.position.set(x, trunkHeight + (type === 'pine' ? 1.8 : 1.5), z);
+        foliage.position.y = trunkHeight + (type === 'pine' ? 1.8 * scale : 1.5 * scale);
         foliage.castShadow = true;
-        scene.add(foliage);
+        treeGroup.add(foliage);
         
-        // Add small bushes around some trees
-        if (Math.random() > 0.6) {
-          const bushGeometry = new THREE.SphereGeometry(0.5 + Math.random() * 0.3, 6, 4);
-          const bushMaterial = new THREE.MeshLambertMaterial({ 
-            color: new THREE.Color().setHSL(0.28, 0.5, 0.2 + Math.random() * 0.1)
-          });
-          const bush = new THREE.Mesh(bushGeometry, bushMaterial);
-          const bushOffset = 1.5 + Math.random() * 1;
-          const bushAngle = Math.random() * Math.PI * 2;
-          bush.position.set(
-            x + Math.cos(bushAngle) * bushOffset,
-            0.3,
-            z + Math.sin(bushAngle) * bushOffset
-          );
-          bush.castShadow = true;
-          scene.add(bush);
-        }
+        treeGroup.position.set(x, 0, z);
+        treeGroup.userData = { originalY: foliage.position.y, swaySpeed: 0.5 + Math.random() * 0.5 };
+        scene.add(treeGroup);
       });
 
-      console.log('✅ Beautiful tree landscape created!');
-    };
-
-    // Initialize landscaping
-    createTrees();
-
-    // Add urban details (signs, barriers, etc.)
-    const addUrbanDetails = async () => {
-      try {
-        const [sign, barrier] = await Promise.all([
-          loadRoadModel(roadAssets.sign),
-          loadRoadModel(roadAssets.barrier)
-        ]);
-
-        // Add highway signs at district entrances
-        const signPositions = [
-          { x: -50, z: -5, rotation: 0, text: 'Auth District' },
-          { x: 50, z: 5, rotation: Math.PI, text: 'API District' },
-          { x: 5, z: -50, rotation: Math.PI / 2, text: 'Database District' },
-          { x: -5, z: 50, rotation: -Math.PI / 2, text: 'UI District' },
-        ];
-
-        signPositions.forEach(({ x, z, rotation }) => {
-          const signInstance = sign.clone();
-          signInstance.position.set(x, 0, z);
-          signInstance.rotation.y = rotation;
-          signInstance.scale.setScalar(0.8);
-          scene.add(signInstance);
-        });
-
-        // Add construction barriers around some areas for realism
-        const barrierPositions = [
-          { x: -65, z: -65 }, { x: 65, z: 65 }, { x: -65, z: 65 }, { x: 65, z: -65 },
-          { x: -80, z: 0 }, { x: 80, z: 0 }, { x: 0, z: -80 }, { x: 0, z: 80 },
-        ];
-
-        barrierPositions.forEach(({ x, z }) => {
-          const barrierInstance = barrier.clone();
-          barrierInstance.position.set(x, 0, z);
-          barrierInstance.rotation.y = Math.random() * Math.PI * 2;
-          barrierInstance.scale.setScalar(0.8);
-          scene.add(barrierInstance);
-        });
-
-        console.log('✅ Urban details added successfully!');
-      } catch (error) {
-        console.log('⚠️ Could not load urban detail models, continuing without them');
+      // Floating particles
+      const particleCount = 100;
+      const particleGeometry = new THREE.BufferGeometry();
+      const particlePositions = new Float32Array(particleCount * 3);
+      const particleVelocities = new Float32Array(particleCount * 3);
+      
+      for (let i = 0; i < particleCount; i++) {
+        particlePositions[i * 3] = (Math.random() - 0.5) * 200;
+        particlePositions[i * 3 + 1] = Math.random() * 20 + 5;
+        particlePositions[i * 3 + 2] = (Math.random() - 0.5) * 200;
+        
+        particleVelocities[i * 3] = (Math.random() - 0.5) * 0.02;
+        particleVelocities[i * 3 + 1] = Math.random() * 0.01;
+        particleVelocities[i * 3 + 2] = (Math.random() - 0.5) * 0.02;
       }
+      
+      particleGeometry.setAttribute('position', new THREE.BufferAttribute(particlePositions, 3));
+      particleGeometry.setAttribute('velocity', new THREE.BufferAttribute(particleVelocities, 3));
+      
+      const particleMaterial = new THREE.PointsMaterial({
+        color: 0xffffff,
+        size: 0.1,
+        transparent: true,
+        opacity: 0.6
+      });
+      
+      const particles = new THREE.Points(particleGeometry, particleMaterial);
+      scene.add(particles);
+      
+      (window as any).particles = particles;
     };
 
-    // Add urban details
-    addUrbanDetails();
+    createEnvironment();
 
-    // Add sidewalks around buildings
-    const createSidewalk = (x: number, z: number, width: number, depth: number) => {
-      const sidewalkGeometry = new THREE.PlaneGeometry(width + 2, depth + 2);
-      const sidewalkMaterial = new THREE.MeshLambertMaterial({ color: 0x404040 });
-      const sidewalk = new THREE.Mesh(sidewalkGeometry, sidewalkMaterial);
-      sidewalk.rotation.x = -Math.PI / 2;
-      sidewalk.position.set(x, 0.005, z);
-      scene.add(sidewalk);
-    };
-
-    // Lighting
-    const ambientLight = new THREE.AmbientLight(0x404040, 0.6);
-    scene.add(ambientLight);
-
-    const directionalLight = new THREE.DirectionalLight(0xffffff, 1);
-    directionalLight.position.set(50, 50, 50);
-    directionalLight.castShadow = true;
-    directionalLight.shadow.mapSize.width = 2048;
-    directionalLight.shadow.mapSize.height = 2048;
-    scene.add(directionalLight);
-
-    // GLTFLoader
+    // GLTFLoader for buildings
     const gltfLoader = new GLTFLoader();
 
-    // Model paths for different building types
-    const modelPaths = {
-      modules: [
-        '/GLB%20format/building-skyscraper-a.glb',
-        '/GLB%20format/building-skyscraper-b.glb',
-        '/GLB%20format/building-skyscraper-c.glb',
-        '/GLB%20format/building-skyscraper-d.glb',
-        '/GLB%20format/building-skyscraper-e.glb'
-      ],
-      classes: [
-        '/GLB%20format/building-a.glb',
-        '/GLB%20format/building-b.glb',
-        '/GLB%20format/building-c.glb',
-        '/GLB%20format/building-d.glb',
-        '/GLB%20format/building-e.glb',
-        '/GLB%20format/building-f.glb',
-        '/GLB%20format/building-g.glb',
-        '/GLB%20format/building-h.glb'
-      ],
-      functions: [
-        '/GLB%20format/low-detail-building-a.glb',
-        '/GLB%20format/low-detail-building-b.glb',
-        '/GLB%20format/low-detail-building-c.glb',
-        '/GLB%20format/low-detail-building-d.glb',
-        '/GLB%20format/low-detail-building-e.glb',
-        '/GLB%20format/low-detail-building-f.glb',
-        '/GLB%20format/low-detail-building-g.glb',
-        '/GLB%20format/low-detail-building-h.glb'
-      ]
-    };
-
-    // Structured, deterministic building data representing a real codebase
+    // Building data
     const buildingsData: BuildingData[] = [
-      // CORE DISTRICT (Center) - Main application logic
-      { 
-        position: { x: 0, z: 0 }, type: 'module', name: 'src/main.ts', district: 'core',
-        linesOfCode: 150, complexity: 8, dependencies: ['auth', 'api', 'database']
-      },
-      { 
-        position: { x: -8, z: 8 }, type: 'class', name: 'Application', district: 'core',
-        linesOfCode: 200, complexity: 6, dependencies: ['Router', 'ConfigManager']
-      },
-      { 
-        position: { x: 8, z: 8 }, type: 'class', name: 'Router', district: 'core',
-        linesOfCode: 120, complexity: 4, dependencies: ['ApiController']
-      },
-      { 
-        position: { x: -8, z: -8 }, type: 'function', name: 'bootstrap()', district: 'core',
-        linesOfCode: 45, complexity: 2, dependencies: []
-      },
-      { 
-        position: { x: 8, z: -8 }, type: 'function', name: 'shutdown()', district: 'core',
-        linesOfCode: 30, complexity: 2, dependencies: []
-      },
-
-      // AUTH DISTRICT (Left) - Authentication & Security
-      { 
-        position: { x: -40, z: 0 }, type: 'module', name: 'src/auth/index.ts', district: 'auth',
-        linesOfCode: 180, complexity: 9, dependencies: ['database', 'utils']
-      },
-      { 
-        position: { x: -48, z: 8 }, type: 'class', name: 'AuthService', district: 'auth',
-        linesOfCode: 250, complexity: 7, dependencies: ['UserRepository']
-      },
-      { 
-        position: { x: -32, z: 8 }, type: 'class', name: 'TokenManager', district: 'auth',
-        linesOfCode: 100, complexity: 5, dependencies: ['JwtUtil']
-      },
-      { 
-        position: { x: -48, z: -8 }, type: 'function', name: 'login()', district: 'auth',
-        linesOfCode: 60, complexity: 4, dependencies: ['validateCredentials']
-      },
-      { 
-        position: { x: -32, z: -8 }, type: 'function', name: 'logout()', district: 'auth',
-        linesOfCode: 25, complexity: 2, dependencies: []
-      },
-
-      // API DISTRICT (Right) - External interfaces
-      { 
-        position: { x: 40, z: 0 }, type: 'module', name: 'src/api/index.ts', district: 'api',
-        linesOfCode: 120, complexity: 6, dependencies: ['auth', 'database']
-      },
-      { 
-        position: { x: 48, z: 8 }, type: 'class', name: 'ApiController', district: 'api',
-        linesOfCode: 300, complexity: 8, dependencies: ['AuthService', 'UserService']
-      },
-      { 
-        position: { x: 32, z: 8 }, type: 'class', name: 'ResponseHandler', district: 'api',
-        linesOfCode: 80, complexity: 3, dependencies: []
-      },
-      { 
-        position: { x: 48, z: -8 }, type: 'function', name: 'handleRequest()', district: 'api',
-        linesOfCode: 40, complexity: 3, dependencies: ['validateInput']
-      },
-      { 
-        position: { x: 32, z: -8 }, type: 'function', name: 'sendResponse()', district: 'api',
-        linesOfCode: 20, complexity: 1, dependencies: []
-      },
-
-      // DATABASE DISTRICT (Bottom) - Data persistence
-      { 
-        position: { x: 0, z: -40 }, type: 'module', name: 'src/database/index.ts', district: 'database',
-        linesOfCode: 200, complexity: 7, dependencies: ['utils']
-      },
-      { 
-        position: { x: -8, z: -48 }, type: 'class', name: 'DatabaseManager', district: 'database',
-        linesOfCode: 280, complexity: 9, dependencies: ['ConnectionPool']
-      },
-      { 
-        position: { x: 8, z: -48 }, type: 'class', name: 'UserRepository', district: 'database',
-        linesOfCode: 150, complexity: 5, dependencies: ['QueryBuilder']
-      },
-      { 
-        position: { x: -8, z: -32 }, type: 'function', name: 'connect()', district: 'database',
-        linesOfCode: 35, complexity: 3, dependencies: []
-      },
-      { 
-        position: { x: 8, z: -32 }, type: 'function', name: 'query()', district: 'database',
-        linesOfCode: 50, complexity: 4, dependencies: ['sanitize']
-      },
-
-      // UI DISTRICT (Top) - User interface
-      { 
-        position: { x: 0, z: 40 }, type: 'module', name: 'src/ui/index.ts', district: 'ui',
-        linesOfCode: 90, complexity: 4, dependencies: ['api']
-      },
-      { 
-        position: { x: -8, z: 48 }, type: 'class', name: 'ComponentRenderer', district: 'ui',
-        linesOfCode: 180, complexity: 6, dependencies: ['EventHandler']
-      },
-      { 
-        position: { x: 8, z: 48 }, type: 'class', name: 'StateManager', district: 'ui',
-        linesOfCode: 120, complexity: 5, dependencies: []
-      },
-      { 
-        position: { x: -8, z: 32 }, type: 'function', name: 'render()', district: 'ui',
-        linesOfCode: 40, complexity: 3, dependencies: []
-      },
-      { 
-        position: { x: 8, z: 32 }, type: 'function', name: 'updateState()', district: 'ui',
-        linesOfCode: 25, complexity: 2, dependencies: []
-      },
-
-      // UTILS DISTRICT (Bottom-left) - Utility functions
-      { 
-        position: { x: -40, z: -40 }, type: 'module', name: 'src/utils/index.ts', district: 'utils',
-        linesOfCode: 60, complexity: 3, dependencies: []
-      },
-      { 
-        position: { x: -48, z: -48 }, type: 'class', name: 'Logger', district: 'utils',
-        linesOfCode: 100, complexity: 4, dependencies: []
-      },
-      { 
-        position: { x: -32, z: -48 }, type: 'class', name: 'ConfigManager', district: 'utils',
-        linesOfCode: 80, complexity: 3, dependencies: []
-      },
-      { 
-        position: { x: -48, z: -32 }, type: 'function', name: 'formatDate()', district: 'utils',
-        linesOfCode: 15, complexity: 1, dependencies: []
-      },
-      { 
-        position: { x: -32, z: -32 }, type: 'function', name: 'validateEmail()', district: 'utils',
-        linesOfCode: 20, complexity: 2, dependencies: []
-      }
+      { position: { x: 0, z: 0 }, type: 'module', name: 'src/main.ts', district: 'core', linesOfCode: 150, complexity: 8, dependencies: ['auth', 'api', 'database'] },
+      { position: { x: -8, z: 8 }, type: 'class', name: 'Application', district: 'core', linesOfCode: 200, complexity: 6, dependencies: ['Router'] },
+      { position: { x: 8, z: 8 }, type: 'class', name: 'Router', district: 'core', linesOfCode: 120, complexity: 4, dependencies: [] },
+      { position: { x: -40, z: 0 }, type: 'module', name: 'src/auth/index.ts', district: 'auth', linesOfCode: 180, complexity: 9, dependencies: ['database'] },
+      { position: { x: 40, z: 0 }, type: 'module', name: 'src/api/index.ts', district: 'api', linesOfCode: 120, complexity: 6, dependencies: ['auth'] },
+      { position: { x: 0, z: -40 }, type: 'module', name: 'src/database/index.ts', district: 'database', linesOfCode: 200, complexity: 7, dependencies: [] },
     ];
 
-    // Load a single model
-    const loadModel = (path: string): Promise<THREE.Group> => {
-      return new Promise((resolve, reject) => {
-        console.log(`🏗️ Loading model: ${path}`);
-        gltfLoader.load(
-          path,
-          (gltf: any) => {
-            console.log(`✅ Model loaded: ${path}`);
-            const model = gltf.scene.clone();
-            
-            // Ensure model is properly positioned
-            const box = new THREE.Box3().setFromObject(model);
-            const size = box.getSize(new THREE.Vector3());
-            const center = box.getCenter(new THREE.Vector3());
-            
-            // Center the model
-            model.position.sub(center);
-            model.position.y = size.y / 2;
-            
-            // Enable shadows
-            model.traverse((child: THREE.Object3D) => {
-              if (child instanceof THREE.Mesh) {
-                child.castShadow = true;
-                child.receiveShadow = true;
-              }
-            });
-            
-            resolve(model);
-          },
-          (progress: any) => {
-            const percent = Math.round((progress.loaded / progress.total) * 100);
-            setLoadingProgress(`Loading: ${percent}%`);
-          },
-          (error: any) => {
-            console.error(`❌ Failed to load model: ${path}`, error);
-            reject(error);
-          }
-        );
-      });
-    };
-
-    // Create building with semantic design based on code metrics
+    // Create buildings with physics
     const createBuilding = async (buildingData: BuildingData): Promise<CodeBlock> => {
-      const { position, type, name, district, linesOfCode, complexity, dependencies } = buildingData;
+      const { position, type, name } = buildingData;
       
-      // Select deterministic model based on type and complexity
-      let modelArray: string[];
-      let modelIndex: number;
+      // Simple building geometry
+      const height = 2 + Math.random() * 4;
+      const width = 2 + Math.random() * 2;
+      const depth = 2 + Math.random() * 2;
       
-      switch (type) {
-        case 'module':
-          modelArray = modelPaths.modules;
-          // Use complexity to determine building style (higher complexity = more elaborate building)
-          modelIndex = Math.min(complexity - 1, modelArray.length - 1);
-          break;
-        case 'class':
-          modelArray = modelPaths.classes;
-          // Use lines of code to determine building size
-          modelIndex = Math.min(Math.floor(linesOfCode / 50), modelArray.length - 1);
-          break;
-        case 'function':
-          modelArray = modelPaths.functions;
-          // Use complexity for function building type
-          modelIndex = Math.min(complexity - 1, modelArray.length - 1);
-          break;
-      }
+      const buildingGeometry = new THREE.BoxGeometry(width, height, depth);
+      const buildingMaterial = new THREE.MeshLambertMaterial({ 
+        color: new THREE.Color().setHSL(Math.random(), 0.7, 0.6) 
+      });
+      const buildingMesh = new THREE.Mesh(buildingGeometry, buildingMaterial);
+      buildingMesh.position.set(position.x, height / 2, position.z);
+      buildingMesh.castShadow = true;
+      buildingMesh.receiveShadow = true;
+      buildingMesh.userData = buildingData;
       
-      const selectedModel = modelArray[Math.max(0, modelIndex)];
-      
-      try {
-        const model = await loadModel(selectedModel);
-        
-        // Semantic scaling based on code metrics
-        let scale = 1;
-        let height = 1;
-        
-        switch (type) {
-          case 'module':
-            // Height based on lines of code, width based on dependencies
-            scale = 2 + (dependencies.length * 0.3); // Wider base for more dependencies
-            height = 2 + (linesOfCode / 100); // Taller for more code
-            break;
-          case 'class':
-            // Scale based on lines of code and complexity
-            scale = 1.5 + (linesOfCode / 200);
-            height = 1 + (complexity / 10);
-            break;
-          case 'function':
-            // Simple functions are smaller
-            scale = 0.8 + (complexity * 0.2);
-            height = 0.5 + (linesOfCode / 100);
-            break;
-        }
-        
-        // Apply semantic scaling
-        model.scale.set(scale, height, scale);
-        
-        // Add district-based coloring/materials
-        const districtColor = districts[district as keyof typeof districts]?.color || 0x666666;
-        model.traverse((child) => {
-          if (child instanceof THREE.Mesh && child.material) {
-            // Tint the building with district color
-            const material = child.material as THREE.MeshLambertMaterial;
-            if (material.color) {
-              const originalColor = material.color.getHex();
-              const blendedColor = new THREE.Color(originalColor).lerp(new THREE.Color(districtColor), 0.3);
-              material.color = blendedColor;
-            }
-          }
-        });
-        
-        // Create semantic sidewalk
-        const sidewalkSize = Math.max(scale * 1.5, 3);
-        createSidewalk(position.x, position.z, sidewalkSize, sidewalkSize);
-        
-        // Position the building
-        const buildingGroup = new THREE.Group();
-        buildingGroup.add(model);
-        buildingGroup.position.set(position.x, 0, position.z);
-        buildingGroup.userData = { type, name, district, linesOfCode, complexity, dependencies };
-        
-        // Set userData on all meshes for proper raycasting
-        model.userData = { type, name, district, linesOfCode, complexity, dependencies };
-        model.traverse((child) => {
-          if (child instanceof THREE.Mesh) {
-            child.userData = { type, name, district, linesOfCode, complexity, dependencies };
-          }
-        });
-        
-        scene.add(buildingGroup);
-        
-        console.log(`✅ Created ${district} building: ${name} (${type}) - ${linesOfCode}LOC, complexity:${complexity}`);
-        
-        return { mesh: buildingGroup, type, name };
-      } catch (error) {
-        console.error(`❌ Failed to create building ${name}:`, error);
-        throw error;
-      }
+      const buildingGroup = new THREE.Group();
+      buildingGroup.add(buildingMesh);
+      buildingGroup.userData = buildingData;
+      scene.add(buildingGroup);
+
+      // Physics body
+      const buildingShape = new CANNON.Box(new CANNON.Vec3(width / 2, height / 2, depth / 2));
+      const buildingBody = new CANNON.Body({ mass: 0 });
+      buildingBody.addShape(buildingShape);
+      buildingBody.position.set(position.x, height / 2, position.z);
+      world.addBody(buildingBody);
+
+      return { mesh: buildingGroup, body: buildingBody, type, name };
     };
 
     // Load all buildings
     const loadAllBuildings = async () => {
-      setLoadingProgress('Loading buildings...');
+      setLoadingProgress('Constructing code city...');
       const buildings: CodeBlock[] = [];
       
       for (let i = 0; i < buildingsData.length; i++) {
         try {
           const building = await createBuilding(buildingsData[i]);
           buildings.push(building);
-          setLoadingProgress(`Loaded ${i + 1}/${buildingsData.length} buildings`);
+          setLoadingProgress(`Built ${i + 1}/${buildingsData.length} buildings`);
         } catch (error) {
-          console.error(`Failed to load building ${buildingsData[i].name}`);
+          console.error(`Failed to create building ${buildingsData[i].name}`);
         }
       }
       
       codeBlocksRef.current = buildings;
       setLoadingProgress('');
       setIsLoaded(true);
-      console.log(`🏗️ City loaded with ${buildings.length} buildings!`);
+      
+      // Hide instructions after a delay
+      setTimeout(() => setShowInstructions(false), 8000);
     };
+
+    loadAllBuildings();
+
+    // Input handling
+    const handleKeyDown = (event: KeyboardEvent) => {
+      keysRef.current[event.code] = true;
+      
+      // Camera mode switching
+      if (event.code === 'KeyC') {
+        setCameraMode(prev => {
+          const modes: ('follow' | 'free' | 'overview')[] = ['follow', 'free', 'overview'];
+          const currentIndex = modes.indexOf(prev);
+          return modes[(currentIndex + 1) % modes.length];
+        });
+      }
+      
+      // Toggle instructions
+      if (event.code === 'KeyH') {
+        setShowInstructions(prev => !prev);
+      }
+    };
+
+    const handleKeyUp = (event: KeyboardEvent) => {
+      keysRef.current[event.code] = false;
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    document.addEventListener('keyup', handleKeyUp);
 
     // Mouse interaction
     const raycaster = new THREE.Raycaster();
@@ -834,11 +530,9 @@ const BrunoStyleDemo: React.FC = () => {
       mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
 
       raycaster.setFromCamera(mouse, camera);
-      
       const intersects = raycaster.intersectObjects(scene.children, true);
       
       if (intersects.length > 0) {
-        // Find the building group
         let object = intersects[0].object;
         while (object.parent && !object.userData.name) {
           object = object.parent;
@@ -857,48 +551,111 @@ const BrunoStyleDemo: React.FC = () => {
       }
     };
 
-    const handleClick = (event: MouseEvent) => {
-      if (!mountRef.current) return;
-      
-      const rect = mountRef.current.getBoundingClientRect();
-      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-
-      raycaster.setFromCamera(mouse, camera);
-      
-      const intersects = raycaster.intersectObjects(scene.children, true);
-      
-      if (intersects.length > 0) {
-        let object = intersects[0].object;
-        while (object.parent && !object.userData.name) {
-          object = object.parent;
-        }
-        
-        if (object.userData.name) {
-          console.log(`🖱️ Clicked on: ${object.userData.name} (${object.userData.type})`);
-          
-          // Simple click animation
-          const originalScale = object.scale.x;
-          object.scale.setScalar(originalScale * 1.1);
-          setTimeout(() => {
-            object.scale.setScalar(originalScale);
-          }, 200);
-        }
-      }
-    };
-
     mountRef.current.addEventListener('mousemove', handleMouseMove);
-    mountRef.current.addEventListener('click', handleClick);
 
     // Animation loop
     const animate = () => {
       requestAnimationFrame(animate);
+      
+      const deltaTime = clockRef.current.getDelta();
+      const elapsedTime = clockRef.current.getElapsedTime();
+      
+      // Update physics
+      world.step(1/60, deltaTime, 3);
+      
+      // Vehicle controls
+      if (vehicleRef.current && isLoaded) {
+        const vehicle = vehicleRef.current;
+        const force = 300;
+        const torque = 50;
+        
+        // Apply forces based on input
+        if (keysRef.current['KeyW'] || keysRef.current['ArrowUp']) {
+          vehicle.body.applyLocalForce(new CANNON.Vec3(0, 0, force), new CANNON.Vec3(0, 0, 0));
+        }
+        if (keysRef.current['KeyS'] || keysRef.current['ArrowDown']) {
+          vehicle.body.applyLocalForce(new CANNON.Vec3(0, 0, -force), new CANNON.Vec3(0, 0, 0));
+        }
+        if (keysRef.current['KeyA'] || keysRef.current['ArrowLeft']) {
+          vehicle.body.applyLocalTorque(new CANNON.Vec3(0, torque, 0));
+        }
+        if (keysRef.current['KeyD'] || keysRef.current['ArrowRight']) {
+          vehicle.body.applyLocalTorque(new CANNON.Vec3(0, -torque, 0));
+        }
+        
+        // Sync mesh with physics body
+        vehicle.mesh.position.copy(vehicle.body.position as any);
+        vehicle.mesh.quaternion.copy(vehicle.body.quaternion as any);
+        
+        // Update wheels
+        vehicle.wheels.forEach((wheel, index) => {
+          wheel.mesh.position.copy(wheel.body.position as any);
+          wheel.mesh.quaternion.copy(wheel.body.quaternion as any);
+        });
+      }
+      
+      // Animate environment
+      scene.traverse((child) => {
+        if (child.userData.originalY !== undefined) {
+          const foliage = child.children[1];
+          if (foliage) {
+            foliage.position.y = child.userData.originalY + Math.sin(elapsedTime * child.userData.swaySpeed) * 0.1;
+            foliage.rotation.z = Math.sin(elapsedTime * child.userData.swaySpeed * 0.7) * 0.05;
+          }
+        }
+      });
+      
+      // Animate particles
+      const particles = (window as any).particles;
+      if (particles) {
+        const positions = particles.geometry.attributes.position.array;
+        const velocities = particles.geometry.attributes.velocity.array;
+        
+        for (let i = 0; i < positions.length; i += 3) {
+          positions[i] += velocities[i];
+          positions[i + 1] += velocities[i + 1];
+          positions[i + 2] += velocities[i + 2];
+          
+          // Reset particles that go too far
+          if (Math.abs(positions[i]) > 100 || positions[i + 1] > 30) {
+            positions[i] = (Math.random() - 0.5) * 200;
+            positions[i + 1] = Math.random() * 5;
+            positions[i + 2] = (Math.random() - 0.5) * 200;
+          }
+        }
+        particles.geometry.attributes.position.needsUpdate = true;
+      }
+      
+      // Camera modes
+      if (vehicleRef.current && cameraRef.current) {
+        const vehicle = vehicleRef.current;
+        
+        switch (cameraMode) {
+          case 'follow':
+            const targetPosition = new THREE.Vector3();
+            vehicle.mesh.getWorldPosition(targetPosition);
+            targetPosition.add(new THREE.Vector3(0, 8, -15));
+            
+            camera.position.lerp(targetPosition, 0.05);
+            camera.lookAt(vehicle.mesh.position);
+            break;
+            
+          case 'overview':
+            const overviewTarget = new THREE.Vector3(0, 50, 50);
+            camera.position.lerp(overviewTarget, 0.02);
+            camera.lookAt(0, 0, 0);
+            break;
+            
+          case 'free':
+            // Free camera - no automatic movement
+            break;
+        }
+      }
+      
       renderer.render(scene, camera);
     };
-    animate();
 
-    // Start loading buildings
-    loadAllBuildings();
+    animate();
 
     // Handle resize
     const handleResize = () => {
@@ -916,8 +673,9 @@ const BrunoStyleDemo: React.FC = () => {
       if (mountRef.current && renderer.domElement) {
         mountRef.current.removeChild(renderer.domElement);
         mountRef.current.removeEventListener('mousemove', handleMouseMove);
-        mountRef.current.removeEventListener('click', handleClick);
       }
+      document.removeEventListener('keydown', handleKeyDown);
+      document.removeEventListener('keyup', handleKeyUp);
       window.removeEventListener('resize', handleResize);
       renderer.dispose();
     };
@@ -934,20 +692,36 @@ const BrunoStyleDemo: React.FC = () => {
       {/* Loading indicator */}
       {!isLoaded && (
         <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-50">
-          <div className="text-white text-xl">{loadingProgress}</div>
+          <div className="text-center">
+            <div className="text-white text-xl mb-4">{loadingProgress}</div>
+            <div className="w-64 h-2 bg-gray-700 rounded-full overflow-hidden">
+              <div className="h-full bg-gradient-to-r from-purple-500 to-pink-500 rounded-full animate-pulse"></div>
+            </div>
+          </div>
         </div>
       )}
       
-      {/* Controls */}
-      <div className="absolute bottom-4 left-4 text-white text-sm bg-black/40 p-3 rounded-lg backdrop-blur-sm">
-        <p className="mb-1">🖱️ Move mouse to explore</p>
-        <p className="mb-1">🖱️ Click buildings to interact</p>
-        <p className="text-xs text-gray-400">Real Kenney.nl 3D models</p>
+      {/* Instructions */}
+      {showInstructions && isLoaded && (
+        <div className="absolute top-4 left-4 bg-black/80 text-white p-4 rounded-lg backdrop-blur-sm max-w-sm">
+          <h3 className="font-bold mb-2">🚗 Drive Through Code City</h3>
+          <div className="text-sm space-y-1">
+            <p><kbd className="bg-gray-700 px-1 rounded">WASD</kbd> or <kbd className="bg-gray-700 px-1 rounded">Arrow Keys</kbd> - Drive</p>
+            <p><kbd className="bg-gray-700 px-1 rounded">C</kbd> - Switch camera mode ({cameraMode})</p>
+            <p><kbd className="bg-gray-700 px-1 rounded">H</kbd> - Toggle help</p>
+            <p className="text-gray-400 mt-2">🖱️ Hover buildings for info</p>
+          </div>
+        </div>
+      )}
+      
+      {/* Camera mode indicator */}
+      <div className="absolute top-4 right-4 bg-black/60 text-white px-3 py-1 rounded-full text-sm">
+        📷 {cameraMode} mode
       </div>
       
       {/* Building info */}
       {hoveredBlock && (
-        <div className="absolute top-4 right-4 bg-black/90 text-white p-4 rounded-lg backdrop-blur-sm max-w-xs">
+        <div className="absolute bottom-4 right-4 bg-black/90 text-white p-4 rounded-lg backdrop-blur-sm max-w-xs">
           <div className="text-lg font-bold mb-2">{hoveredBlock}</div>
           {codeBlocksRef.current.map(block => {
             if (block.name === hoveredBlock && block.mesh.userData) {
@@ -966,12 +740,6 @@ const BrunoStyleDemo: React.FC = () => {
                   <div className="text-sm">
                     <span className="text-red-300">Complexity:</span> {data.complexity}/10
                   </div>
-                  {data.dependencies && data.dependencies.length > 0 && (
-                    <div className="text-sm">
-                      <span className="text-purple-300">Dependencies:</span> {data.dependencies.length}
-                    </div>
-                  )}
-                  <div className="text-xs opacity-70 mt-2">Click to inspect</div>
                 </div>
               );
             }
@@ -979,6 +747,11 @@ const BrunoStyleDemo: React.FC = () => {
           })}
         </div>
       )}
+      
+      {/* Performance indicator */}
+      <div className="absolute bottom-4 left-4 bg-black/60 text-white px-3 py-1 rounded-full text-sm">
+        🌟 Bruno Simon Style Demo
+      </div>
     </div>
   );
 };
